@@ -83,6 +83,17 @@ func (a *Agent) ParseHookInput(raw []byte) (*agent.HookData, error) {
 		transcriptData = []byte(hook.TranscriptData)
 	}
 
+	// If no inline transcript and the flat file path doesn't exist, try SQLite (OpenCode v1.2+).
+	// This handles the case where client.session.messages() fails or returns an unexpected format.
+	if len(transcriptData) == 0 && hook.DataDir != "" && hook.SessionID != "" {
+		if transcriptPath == "" || !flatFilePathExists(transcriptPath) {
+			if data := fetchTranscriptFromSQLite(hook.DataDir, hook.SessionID); len(data) > 0 {
+				transcriptData = data
+				transcriptPath = "" // SQLite data is inline; no file path needed
+			}
+		}
+	}
+
 	return &agent.HookData{
 		SessionID:      hook.SessionID,
 		TranscriptPath: transcriptPath,
@@ -92,16 +103,56 @@ func (a *Agent) ParseHookInput(raw []byte) (*agent.HookData, error) {
 	}, nil
 }
 
+// flatFilePathExists returns true if the path exists and is a non-empty directory or a file.
+func flatFilePathExists(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	if info.IsDir() {
+		entries, err := os.ReadDir(path)
+		return err == nil && len(entries) > 0
+	}
+	return true
+}
+
+// fetchTranscriptFromSQLite queries the OpenCode SQLite database for messages in a session.
+func fetchTranscriptFromSQLite(dataDir, sessionID string) []byte {
+	dbPath := filepath.Join(dataDir, "opencode.db")
+	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+		return nil
+	}
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		return nil
+	}
+
+	msgQuery := fmt.Sprintf(
+		`SELECT json_group_array(json_patch(data, json_object('id', id))) FROM message WHERE session_id='%s' ORDER BY time_created;`,
+		sessionID,
+	)
+	cmd := exec.Command("sqlite3", dbPath, msgQuery)
+	output, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+
+	result := []byte(strings.TrimSpace(string(output)))
+	if string(result) == "[null]" || string(result) == "[]" || len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
 // IsCommitCommand checks if a tool invocation represents a git commit.
 func (a *Agent) IsCommitCommand(toolName, command string) bool {
 	// OpenCode tool names for shell execution
 	shellTools := map[string]bool{
-		"bash":               true,
-		"shell":              true,
-		"terminal":           true,
-		"execute":            true,
-		"run":                true,
-		"command":            true,
+		"bash":     true,
+		"shell":    true,
+		"terminal": true,
+		"execute":  true,
+		"run":      true,
+		"command":  true,
 	}
 
 	if !shellTools[toolName] {
@@ -454,7 +505,6 @@ func parseOpenCodeEntry(raw map[string]json.RawMessage, fullData []byte) agent.T
 	return entry
 }
 
-
 // parseOpenCodeMessage parses message content from an OpenCode entry.
 func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageType) *agent.Message {
 	if msgType == "" {
@@ -497,4 +547,3 @@ func parseOpenCodeMessage(raw map[string]json.RawMessage, msgType agent.MessageT
 
 	return msg
 }
-
